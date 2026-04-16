@@ -218,7 +218,7 @@ No dataset required — synthetic images are generated at runtime. To reproduce 
 field figures above:
 
 ```bash
-python generate_demo_visuals.py   # requires Img238.jpg (wide) + Img333.jpg (tele)
+python generate_demo_visuals.py   # requires Wide_raw.jpg (wide) + Tele_raw.jpg (tele)
 ```
 
 ---
