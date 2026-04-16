@@ -4,9 +4,9 @@
 ![OpenCV](https://img.shields.io/badge/OpenCV-4.5%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-lightgrey)
 
-A vision-based pipeline for **high-precision 3D localisation of survey markers** on slopes,
-using a single zoom camera operating in two focal lengths — wide for scene-level detection,
-tele for sub-pixel measurement. No stereo rig, no LiDAR, no baseline calibration required.
+A vision pipeline for **high-precision 3D localisation of survey markers on slopes**,
+using a single zoom camera that captures both a wide-angle overview and a telephoto
+close-up — no stereo rig, no LiDAR, no inter-camera baseline required.
 
 ![Pipeline](demo_output/00_pipeline_diagram.jpg)
 
@@ -14,134 +14,148 @@ tele for sub-pixel measurement. No stereo rig, no LiDAR, no baseline calibration
 
 ## Application
 
-Long-term displacement monitoring of slope surfaces requires repeated, precise measurement
-of fixed reference targets across a wide spatial range. Traditional survey instruments
-(total stations, GNSS) are accurate but require on-site access; photogrammetric methods
-need multi-view setups or dense stereo rigs.
+Monitoring long-term surface displacement on slopes requires repeated, precise measurement
+of fixed reference markers across a wide spatial range. Traditional instruments (total
+stations, GNSS) are accurate but demand on-site access; photogrammetric methods need
+multi-view rigs or dense stereo setups.
 
-This pipeline achieves centimetre-level 3D localisation of **orange spherical markers**
-from a single fixed camera position, automating what would otherwise require manual
-measurement or expensive instrumentation.
+This pipeline automates marker localisation from a **single fixed camera position**,
+working at ranges of 15–25 m with centimetre-level 3D accuracy.
 
 ---
 
-## Why a zoom camera — and why it creates a hard constraint
+## Input: wide-angle overview + telephoto close-up
 
-The system uses a **varifocal (zoom) lens**, capturing both a wide-angle overview and a
-telephoto close-up from the **same optical centre**. This design is intentional: it
-mirrors how biological vision systems work — a wide field of view for scene-level
-detection, a narrow field for precise measurement — and avoids the mechanical complexity
-and calibration burden of a two-camera rig.
+The system takes two images captured at the same instant from the same camera, at
+different focal lengths.
 
-But it introduces a fundamental geometric constraint:
+**Wide-angle image** — captures the full slope scene and all markers simultaneously:
 
-> Because the optical centre does not move between focal lengths, **there is no baseline**
-> between the wide and tele images. Standard stereo triangulation — which recovers depth
-> from the disparity between two viewpoints — is impossible.
+![Wide image](demo_output/wide_raw.jpg)
 
-The tele→wide pixel mapping is a pure rotation + zoom, described entirely by a 3×3
-homography H. There is no translation component, no epipolar geometry, no disparity.
+**Telephoto image** — zooms in on selected markers for precise measurement:
 
-**Depth must therefore come from a different source: the known physical size of the
-marker.** A sphere of radius R that subtends angular radius α satisfies:
+![Tele image](demo_output/tele_raw.jpg)
+
+This two-focal-length design mirrors how biological vision works: a wide field of view
+for scene-level awareness, a narrow field for precise measurement of the target.
+It avoids the mechanical complexity of a two-camera rig — but it also introduces a
+hard geometric constraint described below.
+
+---
+
+## The core constraint — and how it is resolved
+
+Because the camera uses a **varifocal (zoom) lens**, both images share the same optical
+centre. There is no physical baseline between them.
+
+This means **stereo triangulation is impossible**: depth from parallax requires two
+viewpoints separated by a baseline; here the baseline is zero and epipolar geometry does
+not apply.
+
+The tele→wide pixel mapping is instead a pure rotation + zoom, fully described by a
+3×3 homography H with no translation component.
+
+Depth must therefore come from a different source: the **known physical size of the
+marker**. A sphere of radius R that subtends angular radius α satisfies:
 
 ```
 D = R / sin(α)
 ```
 
-This equation is the geometric foundation of the entire pipeline. Every algorithmic
-choice — subpixel boundary detection, multi-scale registration, distortion correction —
-exists to make `α` as accurate as possible.
+This single equation is the geometric foundation of the entire pipeline. Every
+algorithmic choice that follows — subpixel boundary detection, multi-scale
+registration, distortion correction — exists to make `α` as accurate as possible.
 
 ---
 
 ## Pipeline
 
-Three stages. The wide image locates targets; the tele image measures them precisely;
-the two are fused to recover 3D position.
+Three stages. Wide detects; tele measures; the two fuse into a 3D position.
 
 ---
 
-### Stage 1 — Subpixel marker detection (tele image)
+### Stage 1 — Wide-angle target detection
+
+The wide image scans the full scene and identifies all marker candidates using HSV
+segmentation. This gives the positions and approximate sizes of every visible marker,
+which then anchor the telephoto registration in Stage 2.
+
+![Wide detection](demo_output/01_wide_detection.jpg)
+
+*All markers detected and labelled in the wide-angle image.*
+
+---
+
+### Stage 2 — Subpixel circle fit (tele image)
 
 The telephoto image provides high angular resolution on each marker. Because `α` is
-computed directly from the fitted circle radius, circle-fit error propagates linearly
-into distance error — making subpixel accuracy here a direct requirement for
-centimetre-level 3D output.
+computed from the fitted radius, circle-fit error propagates directly into distance
+error — making subpixel accuracy here a hard requirement for centimetre-level output.
 
-**Coarse detection:** HSV segmentation in both red-hue wrap regions (0° and 180°),
-followed by morphological cleaning and circularity filtering, gives an initial bounding
-circle for each candidate.
-
-**Red-likelihood map:** rather than using the binary mask for edge detection, a smooth
-per-pixel redness score `L = hue_closeness × saturation × value^γ` provides a continuous
-boundary signal. This avoids hard thresholding artefacts near shadow boundaries and
+**Red-likelihood map:** a smooth per-pixel redness score
+`L = hue_closeness × saturation × value^γ` replaces the binary HSV mask with a
+continuous boundary signal, avoiding hard-thresholding artefacts near shadows and
 specular highlights.
 
 ![Likelihood map](demo_output/03_likelihood_map.jpg)
 
-**Subpixel boundary sampling:** radial profiles are cast at 720 angles, sampled at
-0.5 px steps. Each edge is located via gradient-peak parabola fit, then refined by
-cross-threshold interpolation. An alpha-sweep over threshold blend levels selects the
-value that minimises the subsequent fitting residual.
+**Subpixel boundary sampling:** radial profiles at 720 angles, 0.5 px step. Each
+edge is located via gradient-peak parabola fit then refined by cross-threshold
+interpolation.
 
-**IRLS circle fit:** the ~700 accepted boundary points are fitted with Iteratively
-Re-weighted Least Squares (Huber M-estimator):
+**IRLS circle fit** with Huber M-estimator — specular highlights and partial
+occlusions are down-weighted, not discarded:
 
 ```
 e_i = ||p_i − c|| − r
 w_i = min(1,  k·σ / |e_i|)     k = 1.345,   σ = 1.4826 · MAD(e)
 ```
 
-Points corrupted by specular highlights or partial occlusion are down-weighted, not
-discarded. The covariance matrix yields per-parameter uncertainty.
+The covariance matrix gives per-parameter uncertainty.
 
-![Ball #0 fit](demo_output/tele_target_00_overlay.jpg)
+![Marker #0 fit](demo_output/tele_target_00_overlay.jpg)
 
 | | cx | cy | r | Coverage |
 |---|---|---|---|---|
 | Marker #0 | 2673.45 px | 2226.74 px | 352.80 px | 97.9% |
 | Std | ±0.086 px | ±0.092 px | ±0.063 px | — |
 
-![Ball #1 fit](demo_output/tele_target_01_overlay.jpg)
+![Marker #1 fit](demo_output/tele_target_01_overlay.jpg)
 
 | | cx | cy | r | Coverage |
 |---|---|---|---|---|
 | Marker #1 | 4961.96 px | 1350.80 px | 280.59 px | 98.3% |
 | Std | ±0.185 px | ±0.191 px | ±0.133 px | — |
 
-Sub-pixel centre accuracy **< 0.2 px std**, 98% angular coverage on both markers.
+Sub-pixel centre accuracy **< 0.2 px std**, 98% angular coverage.
 
 ---
 
-### Stage 2 — Wide-tele image registration
+### Stage 3 — Wide-tele registration
 
-To convert tele pixel coordinates into wide camera rays, the homography H\_total that
-maps tele pixels to wide pixels must be estimated. Because the scale ratio between
-wide and tele is **unknown at runtime** (it changes with zoom position), this cannot
-be pre-calibrated and must be solved per-image.
+To convert tele pixel coordinates into wide camera rays, the homography H\_total
+mapping tele → wide pixels must be estimated. The zoom ratio is **unknown at runtime**
+(it varies with zoom position) so it cannot be pre-calibrated and must be solved
+per-image.
 
-Registration is **target-driven**: the search is anchored to the detected marker centre
-rather than the full image, concentrating computation where accuracy matters and
-avoiding sensitivity to background clutter at very different scales.
+The search is **target-driven**: anchored to the detected marker centre, not the full
+image — concentrating computation where accuracy matters.
 
-**Multi-scale template matching:** 33 candidate scale values are searched using
-gradient-magnitude features. Each candidate is scored as a log-posterior:
+**Multi-scale template matching** over 33 candidate scale values, scored as:
 
 ```
 logpost = NCC  +  w_PSR · PSR  +  w_prior · log p(s)
 ```
 
-PSR (Peak-to-Sidelobe Ratio) measures peak sharpness — high PSR indicates an
-unambiguous match. A log-Gaussian prior on scale prevents degenerate solutions.
+PSR (Peak-to-Sidelobe Ratio) measures match-peak sharpness. A log-Gaussian prior on
+scale prevents degenerate solutions. **ECC** refinement then aligns the best scale to
+sub-pixel accuracy.
 
-**ECC refinement:** the best scale is refined to sub-pixel accuracy by maximising
-the Enhanced Correlation Coefficient, giving a full 2×3 Euclidean warp.
-
-The final homography composes all three layers:
+The three components compose into one homography:
 
 ```
-H_total = T · ECC · S      (scale × ECC warp × template-match translation)
+H_total = T · ECC · S
 
 H_total =
 ⎡ 0.20625  −0.00117  466.77 ⎤
@@ -149,13 +163,12 @@ H_total =
 ⎣ 0.00000   0.00000    1.00  ⎦
 ```
 
-The 0.206 diagonal confirms the zoom ratio. The 0.33° implied rotation is consistent
-with a zoom lens introducing negligible rotation between focal lengths.
+Scale = **0.206**, rotation = **0.33°** — consistent with a zoom lens.
 
 ![Registration blend](demo_output/04_registration_blend.jpg)
 
-*Alpha blend of tele (warped) onto wide. The green crosshair marks the tele marker
-centre projected via H\_total — it lands on the wide marker.*
+*Tele image (warped by H\_total) alpha-blended onto wide. Green crosshair = tele
+marker centre projected via H\_total.*
 
 | ECC ρ | Photometric RMSE | Scale |
 |-------|-----------------|-------|
@@ -163,10 +176,9 @@ centre projected via H\_total — it lands on the wide marker.*
 
 ---
 
-### Stage 3 — 3D fusion
+### Stage 4 — 3D fusion
 
-With a subpixel circle fit from Stage 1 and H\_total from Stage 2, depth and direction
-are estimated independently and combined:
+Depth from **tele angular radius** combined with direction from the **wide camera ray**:
 
 ```
 α  =  median  atan2(||r_c × r_b||,  r_c · r_b)   over all ~700 boundary rays
@@ -174,15 +186,8 @@ D  =  R / sin(α)
 P  =  D · undistort( H_total · p_tele )
 ```
 
-**Depth** comes from the tele image: the marker subtends a large angle (~0.3°), making
-the angular-radius estimate highly sensitive to small distance changes.
-
-**Direction** comes from the wide camera ray: the wide image provides a stable
-absolute pointing reference with minimal distortion sensitivity.
-
-Using the **median of all boundary ray angles** — rather than the single fitted
-radius — provides additional robustness to any outlier boundary points retained by
-IRLS.
+Using the median of all boundary ray angles — not just the fitted radius — adds a
+further layer of robustness against any outlier boundary points retained by IRLS.
 
 ![3D result](demo_output/05_3d_result.jpg)
 
@@ -191,12 +196,9 @@ IRLS.
 | #0 | 17.129 | −2.430 | +0.143 | 16.955 | 0.3345 |
 | #1 | 21.571 | −2.244 | −0.132 | 21.454 | 0.2656 |
 
-Tele optical axis relative to wide: **yaw = −8.83°, pitch = +0.34°**
-
-**Dual-branch consistency check:** as an internal validation, the same depth D is
-independently fused with the tele ray rotated via a yaw/pitch matrix derived from
-H\_total — a completely different geometric path. Agreement between the two confirms
-that registration and depth estimation are mutually consistent.
+**Dual-branch consistency check:** the same depth D is independently fused via a
+yaw/pitch rotation matrix derived from H\_total — a completely different geometric
+path. Sub-centimetre agreement between the two validates the pipeline end-to-end.
 
 | Marker | ‖P\_H − P\_R‖ |
 |--------|--------------|
@@ -212,7 +214,7 @@ pip install opencv-python numpy
 python ball_3d_localization_demo.py
 ```
 
-All three modules run on synthetic images — no dataset required. To reproduce the
+No dataset required — synthetic images are generated at runtime. To reproduce the
 field figures above:
 
 ```bash
