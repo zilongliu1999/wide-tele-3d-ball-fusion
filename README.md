@@ -31,11 +31,11 @@ different focal lengths.
 
 **Wide-angle image** — captures the full slope scene and all markers simultaneously:
 
-![Wide image](demo_output/wide_raw.jpg)
+![Wide image](demo_output/Wide_raw.jpg)
 
 **Telephoto image** — zooms in on selected markers for precise measurement:
 
-![Tele image](demo_output/tele_raw.jpg)
+![Tele image](demo_output/Tele_raw.jpg)
 
 This two-focal-length design mirrors how biological vision works: a wide field of view
 for scene-level awareness, a narrow field for precise measurement of the target.
