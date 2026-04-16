@@ -2,423 +2,447 @@
 """
 generate_demo_visuals.py
 ========================
-Runs the three core modules on the REAL wide + tele images and saves
-annotated output images suitable for a GitHub README or portfolio.
+Runs the FULL wide-tele 3D localisation pipeline on real field images and
+saves annotated figures for the GitHub README.
 
-Usage:
+Every figure is produced by the same algorithm described in the README —
+there is no approximation or shortcut:
+
+  Fig 1  Wide-angle detection        detect_wide_red_targets()
+  Fig 2  Tele subpixel fit           process_tele_subpixel()  [IRLS + alpha-sweep]
+  Fig 3  Red-likelihood heatmap      compute_red_likelihood()
+  Fig 4  Wide-tele registration      best_scale_and_translation() + ecc_refine()
+                                     + compose_affine()  →  real H_total
+  Fig 5  3D fusion result            compute_distance_from_boundary_points()
+                                     + undistort_point_to_unit_ray()
+                                     + apply_H_to_point()  →  P = D × r_wide
+
+Usage
+-----
+Place this file alongside the original pipeline script and both input images,
+then run:
+
     python generate_demo_visuals.py
 
-Output (written to ./demo_output/):
-    01_wide_detection.jpg          – wide image with all detected balls annotated
-    02_tele_subpixel.jpg           – tele image with subpixel boundary points + fitted circle
-    03_likelihood_map.jpg          – red-likelihood heatmap (tele)
-    04_registration_blend.jpg      – alpha-blend of tele warped onto wide (registration check)
-    05_3d_result.jpg               – wide image with 3D position annotation per ball
+Requirements
+------------
+    pip install opencv-python numpy
+    # plus the original pipeline file:
+    wide_tele_ballcenter_3d_fusion_v8_dualbranch_mainDw_rw.py
+
+Output
+------
+All figures are written to ./demo_output/
 """
 
-import os, math
+import importlib.util, os, math, time
 import cv2
 import numpy as np
 
-# ── output directory ───────────────────────────────────────────────────────────
-OUT_DIR = "./demo_output"
+# ── paths ─────────────────────────────────────────────────────────────────────
+PIPELINE_FILE = "./wide_tele_ballcenter_3d_fusion_v8_dualbranch_mainDw_rw.py"
+WIDE_PATH     = "./Img238.jpg"
+TELE_PATH     = "./Img333.jpg"
+OUT_DIR       = "./demo_output"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-WIDE_PATH = "./Img238.jpg"
-TELE_PATH = "./Img333.jpg"
-
-# ── camera parameters (from your calibration) ─────────────────────────────────
-K_WIDE = np.array([[1.2207e4, 0.0, 2.7651e3],
-                   [0.0, 1.2208e4, 1.8085e3],
-                   [0.0, 0.0, 1.0]], dtype=np.float64)
-K_TELE = np.array([[6.0411e4, 0.0, 1.9527e3],
-                   [0.0, 6.0421e4, 1.3781e3],
-                   [0.0, 0.0, 1.0]], dtype=np.float64)
-D_ZERO = np.zeros((1, 5), dtype=np.float64)   # distortion ignored for demo
-SPHERE_RADIUS_M = 0.10                          # 20 cm diameter ball
+# ── load original pipeline as a module ────────────────────────────────────────
+spec = importlib.util.spec_from_file_location("pipeline", PIPELINE_FILE)
+pl   = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(pl)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  Core algorithm functions (self-contained, no external deps beyond cv2+numpy)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def compute_red_likelihood(img_bgr, hue_width=22.0, v_gamma=0.5):
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    h, s, v = cv2.split(hsv)
-    h = h.astype(np.float32)
-    s = s.astype(np.float32) / 255.0
-    v = v.astype(np.float32) / 255.0
-    d = np.minimum(np.abs(h), np.abs(h - 180.0))
-    closeness = np.clip(1.0 - d / hue_width, 0.0, 1.0)
-    return closeness * s * np.power(v, v_gamma)
-
-
-def detect_balls_coarse(img_bgr, min_area=300, min_r=5):
-    """HSV segmentation → list of coarse (cx, cy, r, contour)."""
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    m1 = cv2.inRange(hsv, (0,  60, 60), (15, 255, 255))
-    m2 = cv2.inRange(hsv, (155, 60, 60), (180, 255, 255))
-    mask = cv2.bitwise_or(m1, m2)
-    k = np.ones((9, 9), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    results = []
-    for c in cnts:
-        a = cv2.contourArea(c)
-        if a < min_area:
-            continue
-        (cx, cy), r = cv2.minEnclosingCircle(c)
-        if r < min_r:
-            continue
-        # circularity filter
-        perim = cv2.arcLength(c, True) + 1e-9
-        circ = 4 * math.pi * a / (perim ** 2)
-        if circ < 0.45:
-            continue
-        results.append((float(cx), float(cy), float(r), c))
-    results.sort(key=lambda x: -x[2])
-    return results, mask
-
-
-def _bilinear(img_f, xs, ys):
-    H, W = img_f.shape
-    xs = np.clip(xs, 0, W - 2 - 1e-6);  ys = np.clip(ys, 0, H - 2 - 1e-6)
-    x0 = np.floor(xs).astype(int);       y0 = np.floor(ys).astype(int)
-    x1, y1 = x0 + 1, y0 + 1
-    wa=(x1-xs)*(y1-ys); wb=(x1-xs)*(ys-y0); wc=(xs-x0)*(y1-ys); wd=(xs-x0)*(ys-y0)
-    return img_f[y0,x0]*wa + img_f[y1,x0]*wb + img_f[y0,x1]*wc + img_f[y1,x1]*wd
-
-
-def robust_circle_fit(pts, cx0, cy0, r0, iters=40, hk=1.345):
-    pts = np.asarray(pts, np.float64)
-    c = np.array([cx0, cy0], np.float64);  r = float(r0)
-    for _ in range(iters):
-        dx, dy = c[0]-pts[:,0], c[1]-pts[:,1]
-        d = np.hypot(dx, dy) + 1e-12;  res = d - r
-        sig = 1.4826*np.median(np.abs(res-np.median(res))) + 1e-12
-        t = np.abs(res)/sig;  w = np.where(t>hk, hk/t, np.ones_like(t))
-        sw = np.sqrt(w)
-        J = np.column_stack([dx/d, dy/d, -np.ones(len(d))])
-        dlt = np.linalg.solve((J*sw[:,None]).T@(J*sw[:,None]) + 1e-6*np.eye(3),
-                              (J*sw[:,None]).T@(-res*sw))
-        c += dlt[:2];  r = max(float(r+dlt[2]), 1.0)
-        if np.linalg.norm(dlt) < 1e-6: break
-    # uncertainty
-    dx, dy = c[0]-pts[:,0], c[1]-pts[:,1]
-    d = np.hypot(dx,dy)+1e-12; res = d-r
-    sig = 1.4826*np.median(np.abs(res-np.median(res)))+1e-12
-    t = np.abs(res)/sig; w = np.where(t>hk, hk/t, np.ones_like(t))
-    J = np.column_stack([dx/d, dy/d, -np.ones(len(d))])
-    dof = max(len(res)-3,1)
-    s2 = np.sum(w*res**2)/dof
-    std = np.sqrt(np.clip(np.diag(np.linalg.pinv((J.T*w)@J)*s2), 0, np.inf))
-    return float(c[0]), float(c[1]), float(r), res, std
-
-
-def subpixel_boundary(img_bgr, cx0, cy0, r0,
-                      theta_bins=720, band_px=None, step=0.4, alpha=0.25):
-    band_px = band_px or max(15.0, 0.20*r0)
-    L = compute_red_likelihood(img_bgr).astype(np.float64)
-    rs = np.arange(max(1.0, r0-band_px), r0+band_px+1e-9, step)
-    pts = []
-    for bi in range(theta_bins):
-        th = 2*math.pi*bi/theta_bins
-        ct, st = math.cos(th), math.sin(th)
-        xs, ys = cx0+rs*ct, cy0+rs*st
-        prof = _bilinear(L, xs, ys)
-        p32 = prof.astype(np.float32).reshape(-1,1)
-        prof = cv2.GaussianBlur(p32,(1,9),1.5).reshape(-1).astype(np.float64)
-        kf = max(4, int(0.10*len(prof)))
-        Lin, Lout = float(np.median(prof[:kf])), float(np.median(prof[-kf:]))
-        if Lin < 0.05 or Lout > 0.06 or (Lin-Lout) < 0.025: continue
-        g = (prof[1:]-prof[:-1])/step
-        idx = int(np.argmin(g))
-        if -g[idx] < 0.008: continue
-        delta = 0.0
-        if 1 <= idx < len(g)-1:
-            ym1,y0,yp1 = -g[idx-1],-g[idx],-g[idx+1]
-            denom = ym1-2*y0+yp1
-            if abs(denom) > 1e-12: delta = float(np.clip(0.5*(ym1-yp1)/denom,-1,1))
-        r_edge = rs[idx]+(0.5+delta)*step
-        tval = Lout+alpha*(Lin-Lout)
-        for i in range(max(0,idx-14), min(len(prof)-2,idx+14)+1):
-            if prof[i]>=tval>prof[i+1]:
-                frac=(prof[i]-tval)/(prof[i]-prof[i+1]+1e-12)
-                r_edge=rs[i]+frac*step; break
-        pts.append((cx0+r_edge*ct, cy0+r_edge*st))
-    return pts
-
-
-def estimate_distance(center_uv, boundary_pts, K, sphere_radius_m):
-    def ray(u, v):
-        p = np.array([[[u,v]]], np.float64)
-        und = cv2.undistortPoints(p, K, D_ZERO, P=None)
-        x,y = float(und[0,0,0]), float(und[0,0,1])
-        r = np.array([x,y,1.0]); return r/np.linalg.norm(r)
-    rc = ray(*center_uv)
-    alphas = []
-    for (x,y) in boundary_pts:
-        rb = ray(float(x), float(y))
-        dot = float(np.clip(np.dot(rc,rb),-1,1))
-        sinv = float(np.linalg.norm(np.cross(rc,rb)))
-        a = math.atan2(sinv, dot)
-        if a > 1e-8: alphas.append(a)
-    if len(alphas) < 20: return None, None
-    alpha = float(np.median(alphas))
-    return float(sphere_radius_m/(math.sin(alpha)+1e-12)), alpha
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Visualisation helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
-ORANGE = (0, 100, 255)   # BGR
-GREEN  = (50, 220, 50)
-CYAN   = (255, 220, 0)
+# ── colour palette ────────────────────────────────────────────────────────────
 WHITE  = (255, 255, 255)
-BLACK  = (0, 0, 0)
-YELLOW = (0, 230, 230)
+BLACK  = (0,   0,   0  )
+GREEN  = (50,  220, 50 )
+YELLOW = (0,   230, 230)
+CYAN   = (255, 220, 0  )
+ORANGE = (0,   130, 255)
 
-def put_label(img, text, xy, scale=1.0, color=WHITE, thickness=2):
+
+def label(img, text, xy, scale=1.0, color=WHITE, th=2):
     x, y = int(xy[0]), int(xy[1])
     cv2.putText(img, text, (x+1, y+1), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, BLACK, thickness+2, cv2.LINE_AA)
-    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                scale, color, thickness, cv2.LINE_AA)
+                scale, BLACK, th+2, cv2.LINE_AA)
+    cv2.putText(img, text, (x,   y  ), cv2.FONT_HERSHEY_SIMPLEX,
+                scale, color, th,   cv2.LINE_AA)
 
-def scale_for_display(img, max_dim=1600):
+
+def shrink(img, maxd=1800):
     h, w = img.shape[:2]
-    sc = min(1.0, max_dim / max(h, w))
-    if sc < 1.0:
-        img = cv2.resize(img, (int(w*sc), int(h*sc)), interpolation=cv2.INTER_AREA)
-    return img, sc
+    sc = min(1.0, maxd / max(h, w))
+    return cv2.resize(img, (int(w*sc), int(h*sc)), cv2.INTER_AREA) if sc < 1 else img.copy()
+
+
+def save(img, name):
+    path = os.path.join(OUT_DIR, name)
+    cv2.imwrite(path, shrink(img), [cv2.IMWRITE_JPEG_QUALITY, 92])
+    print(f"  → {path}")
+    return path
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIGURE 1 — Wide image: all detected balls annotated
+# Fig 1 — Wide-angle detection
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_fig1_wide_detection(wide_bgr):
-    print("[Fig 1] Wide image ball detection …")
-    balls, mask = detect_balls_coarse(wide_bgr, min_area=500, min_r=8)
+def make_fig1(wide_bgr, wide_targets):
+    """Annotate all detected markers on the wide image."""
+    print("[Fig 1] Wide detection …")
     vis = wide_bgr.copy()
-    for i, (cx, cy, r, cnt) in enumerate(balls):
-        cv2.circle(vis,(int(cx),int(cy)),int(r+4),(0,200,0),3,cv2.LINE_AA)
-        cv2.circle(vis,(int(cx),int(cy)),3,YELLOW,-1,cv2.LINE_AA)
-        put_label(vis, f"#{i}  r={r:.0f}px",
-                  (cx-r, cy-r-18), scale=1.0, color=YELLOW, thickness=2)
-    put_label(vis, f"Wide camera — {len(balls)} balls detected",
-              (30, 60), scale=2.0, color=WHITE, thickness=3)
-    out, _ = scale_for_display(vis, 1600)
-    path = os.path.join(OUT_DIR, "01_wide_detection.jpg")
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"  → {path}  ({len(balls)} balls)")
-    return balls
+    for t in wide_targets:
+        cx, cy, r = int(t["cx"]), int(t["cy"]), int(t["r"])
+        cv2.circle(vis, (cx, cy), r + 4, GREEN, 3, cv2.LINE_AA)
+        cv2.circle(vis, (cx, cy), 4, YELLOW, -1, cv2.LINE_AA)
+        label(vis, f"#{t['id']}", (cx - r, cy - r - 18), 0.9, YELLOW)
+    label(vis, f"Wide camera — {len(wide_targets)} markers detected",
+          (30, 65), 1.8, WHITE, 3)
+    save(vis, "01_wide_detection.jpg")
+    return wide_targets
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIGURE 2 & 3 — Tele image: subpixel boundary + likelihood map
+# Fig 2 — Tele subpixel fit  (uses pl.process_tele_subpixel)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_fig2_tele_subpixel(tele_bgr):
+def make_fig2(tele_bgr):
+    """Run IRLS subpixel detection on tele image; annotate results."""
     print("[Fig 2] Tele subpixel detection …")
-    balls, _ = detect_balls_coarse(tele_bgr, min_area=2000, min_r=30)
-    if not balls:
-        print("  [WARN] No balls found in tele image")
-        return []
+    subdir = os.path.join(OUT_DIR, "_tele_work")
+    os.makedirs(subdir, exist_ok=True)
+    targets = pl.process_tele_subpixel(tele_bgr, out_dir=subdir)
+    print(f"  {len(targets)} target(s) found")
 
     vis = tele_bgr.copy()
-    results = []
-
-    for i, (cx0, cy0, r0, cnt) in enumerate(balls[:3]):   # show up to 3
-        print(f"  Ball #{i}: coarse cx={cx0:.0f} cy={cy0:.0f} r={r0:.0f}")
-        pts = subpixel_boundary(tele_bgr, cx0, cy0, r0)
-        if len(pts) < 60:
-            print(f"    [WARN] only {len(pts)} boundary points — skipping fit")
-            continue
-        cx, cy, r, _, std = robust_circle_fit(pts, cx0, cy0, r0)
-        print(f"    Fitted: cx={cx:.2f} cy={cy:.2f} r={r:.2f}  "
-              f"std=[{std[0]:.3f},{std[1]:.3f},{std[2]:.3f}]")
-
-        # draw boundary dots (every 3rd)
+    for t in targets:
+        cx, cy, r = t["cx"], t["cy"], t["r"]
+        pts = t.get("pts", [])
+        # boundary dots every 3rd point
         for j, (px, py) in enumerate(pts):
             if j % 3 == 0:
-                cv2.circle(vis,(int(round(px)),int(round(py))),2,(0,0,255),-1,cv2.LINE_AA)
-
-        # coarse circle
-        cv2.circle(vis,(int(cx0),int(cy0)),int(r0),(200,200,0),2,cv2.LINE_AA)
-        # fitted circle
-        cv2.circle(vis,(int(round(cx)),int(round(cy))),int(round(r)),GREEN,3,cv2.LINE_AA)
-        # centre cross
-        cv2.drawMarker(vis,(int(round(cx)),int(round(cy))),CYAN,
-                       cv2.MARKER_CROSS,20,2,cv2.LINE_AA)
-
-        put_label(vis,
-                  f"#{i}  r={r:.1f}px  std_r={std[2]:.2f}px  n={len(pts)}pts",
-                  (int(cx-r), int(cy-r-22)), scale=1.1, color=GREEN)
-        results.append(dict(cx=cx,cy=cy,r=r,std=std,pts=pts,cx0=cx0,cy0=cy0,r0=r0))
+                cv2.circle(vis, (int(round(px)), int(round(py))),
+                           2, (0, 0, 255), -1, cv2.LINE_AA)
+        # coarse HSV circle
+        cv2.circle(vis, (int(t["cx0"]), int(t["cy0"])), int(t["r0"]),
+                   (200, 200, 0), 2, cv2.LINE_AA)
+        # IRLS fit
+        cv2.circle(vis, (int(round(cx)), int(round(cy))), int(round(r)),
+                   GREEN, 3, cv2.LINE_AA)
+        cv2.drawMarker(vis, (int(round(cx)), int(round(cy))),
+                       CYAN, cv2.MARKER_CROSS, 24, 2, cv2.LINE_AA)
+        std_r = t.get("std_r", 0.0)
+        label(vis,
+              f"#{t['id']}  r={r:.1f}px  std_r={std_r:.3f}px"
+              f"  cov={t.get('coverage',0):.0%}",
+              (int(cx - r), int(cy - r - 26)), 1.1, GREEN)
 
     # legend
-    cv2.circle(vis,(50,40),8,(200,200,0),-1); put_label(vis,"Coarse HSV",(70,48),0.9,color=(200,200,0))
-    cv2.circle(vis,(50,80),8,GREEN,-1);       put_label(vis,"IRLS fit",(70,88),0.9,color=GREEN)
-    cv2.circle(vis,(50,120),4,(0,0,255),-1);  put_label(vis,"Subpixel boundary pts",(70,128),0.9,color=(0,0,255))
-    put_label(vis,"Tele camera — subpixel circle fit",(30,vis.shape[0]-30),
-              scale=1.8, color=WHITE, thickness=3)
+    for i, (col, txt) in enumerate([
+            ((200, 200, 0), "Coarse HSV"),
+            (GREEN,         "IRLS fit"),
+            ((0, 0, 255),   "Subpixel boundary")]):
+        yy = 40 + i * 44
+        cv2.circle(vis, (50, yy), 8, col, -1)
+        label(vis, txt, (70, yy + 8), 0.9, col)
+    label(vis, "Tele — subpixel circle fit (IRLS + Huber)",
+          (30, vis.shape[0] - 30), 1.8, WHITE, 3)
+    save(vis, "02_tele_subpixel.jpg")
+    return targets
 
-    out, _ = scale_for_display(vis, 1600)
-    path = os.path.join(OUT_DIR, "02_tele_subpixel.jpg")
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"  → {path}")
-    return results
 
+# ══════════════════════════════════════════════════════════════════════════════
+# Fig 3 — Red-likelihood heatmap
+# ══════════════════════════════════════════════════════════════════════════════
 
-def make_fig3_likelihood(tele_bgr):
+def make_fig3(tele_bgr, tele_targets):
     print("[Fig 3] Likelihood heatmap …")
-    L = compute_red_likelihood(tele_bgr)
-    # Normalise to uint8 and apply colour map
-    L8 = np.clip(L / (L.max()+1e-12) * 255, 0, 255).astype(np.uint8)
+    L  = pl.compute_red_likelihood(tele_bgr,
+                                   hue_width=pl.HUE_WIDTH,
+                                   v_gamma=pl.V_GAMMA)
+    L8 = np.clip(L / (L.max() + 1e-12) * 255, 0, 255).astype(np.uint8)
     heat = cv2.applyColorMap(L8, cv2.COLORMAP_INFERNO)
-    # overlay contour of balls for reference
-    balls, _ = detect_balls_coarse(tele_bgr, min_area=2000, min_r=30)
-    for (cx,cy,r,cnt) in balls[:3]:
-        cv2.circle(heat,(int(cx),int(cy)),int(r),(0,255,200),3,cv2.LINE_AA)
-    put_label(heat,"Red-likelihood map  L = Hue × Sat × Val^γ",
-              (20, 55), scale=1.6, color=WHITE, thickness=2)
-    out, _ = scale_for_display(heat, 1600)
-    path = os.path.join(OUT_DIR, "03_likelihood_map.jpg")
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"  → {path}")
+    for t in tele_targets:
+        cv2.circle(heat, (int(t["cx"]), int(t["cy"])), int(t["r"]),
+                   (0, 255, 200), 3, cv2.LINE_AA)
+    label(heat, "Red-likelihood map  L = Hue × Sat × Val^γ",
+          (20, 58), 1.6, WHITE, 2)
+    save(heat, "03_likelihood_map.jpg")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  FIGURE 4 — Registration: warp tele onto wide (alpha blend)
+# Fig 4 — Wide-tele registration (real multi-scale TM + ECC + H_total)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def make_fig4_registration(wide_bgr, tele_bgr, wide_balls, tele_results):
-    print("[Fig 4] Registration blend …")
-    if not wide_balls or not tele_results:
-        print("  [SKIP] Need at least one ball in each image")
+def make_fig4(wide_bgr, tele_bgr, wide_targets, tele_targets):
+    """
+    Runs best_scale_and_translation → ecc_refine → compose_affine
+    exactly as the production pipeline does. Returns H_total.
+    """
+    print("[Fig 4] Registration (multi-scale TM + ECC) …")
+
+    wide_gray = pl.to_gray_u8(wide_bgr)
+    tele_gray = pl.to_gray_u8(tele_bgr)
+    wide_feat = pl.grad_mag_u8(wide_gray)
+    tele_feat = pl.grad_mag_u8(tele_gray)
+
+    primary = pl.pick_primary_target(tele_targets,
+                                     float(pl.K_TELE[0, 2]),
+                                     float(pl.K_TELE[1, 2]))
+    tele_xy = (primary["cx"], primary["cy"])
+
+    s_prior  = float(pl.S_PRIOR_DEFAULT)
+    best_all = None
+
+    for w in wide_targets[:6]:           # top-6 by size, same as production
+        wid  = int(w["id"])
+        cxw, cyw = float(w["cx"]), float(w["cy"])
+
+        t0   = time.time()
+        best = pl.best_scale_and_translation(
+            wide_feat, tele_feat,
+            tele_primary_xy=tele_xy,
+            wide_cand_xy=(cxw, cyw),
+            s_prior=s_prior,
+            scan_csv_path=None,
+            best_heatmap_path=None)
+        if best is None:
+            print(f"  wide#{wid}: TM failed ({time.time()-t0:.1f}s)")
+            continue
+
+        tele_s = cv2.resize(tele_gray, (best["tw"], best["th"]),
+                            interpolation=cv2.INTER_AREA)
+        patch  = wide_gray[best["y"]:best["y"]+best["th"],
+                           best["x"]:best["x"]+best["tw"]]
+        if patch.shape != tele_s.shape:
+            continue
+
+        ecc_cc, warp_roi = pl.ecc_refine(tele_s, patch)
+        if ecc_cc is None:
+            print(f"  wide#{wid}: ECC failed")
+            continue
+
+        tele_warp = cv2.warpAffine(tele_s, warp_roi,
+                                   (best["tw"], best["th"]),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=pl.BORDER_MODE)
+        rmse, _, _ = pl.rmse_photometric(patch, tele_warp)
+        score = (float(ecc_cc)
+                 + pl.W_FINAL_MATCH * float(best["score"])
+                 - pl.W_FINAL_RMSE  * float(rmse))
+
+        print(f"  wide#{wid}: scale={best['s']:.4f}  "
+              f"NCC={best['score']:.4f}  PSR={best['psr']:.1f}  "
+              f"ECC={ecc_cc:.4f}  RMSE={rmse:.4f}  "
+              f"final={score:.4f}  ({time.time()-t0:.1f}s)")
+
+        rec = dict(wide_id=wid, best=best, ecc_cc=float(ecc_cc),
+                   warp_roi=warp_roi, rmse=float(rmse), final_score=float(score))
+        if best_all is None or score > best_all["final_score"]:
+            best_all = rec
+
+    if best_all is None:
+        print("  [WARN] Registration failed — skipping Fig 4 / Fig 5")
         return None
 
-    Hw, Ww = wide_bgr.shape[:2]
-    Ht, Wt = tele_bgr.shape[:2]
+    _, H_total = pl.compose_affine(best_all["best"], best_all["warp_roi"])
+    best_s     = best_all["best"]["s"]
+    print(f"\n  Best: wide#{best_all['wide_id']}  "
+          f"scale={best_s:.4f}  ECC={best_all['ecc_cc']:.4f}  "
+          f"RMSE={best_all['rmse']:.4f}")
 
-    # Use the largest tele ball and best-matching wide ball
-    tr = tele_results[0]
-    # Estimate scale: tele focal length / wide focal length ≈ 60411/12207 ≈ 4.95
-    # so tele covers ~1/5 of the wide FOV
-    s = float(K_TELE[0,0]) / float(K_WIDE[0,0]) * 0.20   # empirical display scale
+    # ── visualise: warp full-colour tele patch onto wide ──────────────────────
+    b     = best_all["best"]
+    tw, th_px = b["tw"], b["th"]
+    bx, by    = b["x"],  b["y"]
 
-    tw = max(60, int(Wt * s))
-    th = max(60, int(Ht * s))
-    tele_small = cv2.resize(tele_bgr, (tw, th), interpolation=cv2.INTER_AREA)
+    tele_col_s = cv2.resize(tele_bgr, (tw, th_px), interpolation=cv2.INTER_AREA)
+    tele_warp_col = cv2.warpAffine(tele_col_s, best_all["warp_roi"],
+                                   (tw, th_px),
+                                   flags=cv2.INTER_LINEAR,
+                                   borderMode=pl.BORDER_MODE)
 
-    # Place tele thumbnail centred on the corresponding wide ball
-    wb = wide_balls[0]
-    cx_w, cy_w = int(wb[0]), int(wb[1])
-    x0 = max(0, cx_w - tw//2);  y0 = max(0, cy_w - th//2)
-    x1 = min(Ww, x0+tw);        y1 = min(Hw, y0+th)
-    tw2, th2 = x1-x0, y1-y0
-
-    blend = wide_bgr.copy().astype(np.float32)
-    tele_roi = tele_small[:th2, :tw2].astype(np.float32)
-    blend[y0:y1, x0:x1] = blend[y0:y1, x0:x1]*0.50 + tele_roi*0.50
-    blend = np.clip(blend, 0, 255).astype(np.uint8)
-
-    # Annotate
-    cv2.rectangle(blend,(x0,y0),(x1,y1),(0,220,255),3,cv2.LINE_AA)
-    put_label(blend,"Tele FOV (warped onto wide)",(x0+6,y0+32),1.0,color=(0,220,255))
-    cv2.circle(blend,(cx_w,cy_w),int(wb[2]+4),GREEN,3,cv2.LINE_AA)
-    put_label(blend,"Wide-Tele Registration — alpha blend (α=0.5)",
-              (30,60),scale=2.0,color=WHITE,thickness=3)
-    # draw an arrow from tele overlay centre to wide ball
-    cv2.arrowedLine(blend,(x0+tw2//2, y0+th2//2),(cx_w,cy_w),YELLOW,3,
-                    cv2.LINE_AA, tipLength=0.03)
-
-    out, _ = scale_for_display(blend, 1600)
-    path = os.path.join(OUT_DIR, "04_registration_blend.jpg")
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"  → {path}")
-    return s
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FIGURE 5 — 3D result: distance estimate projected onto wide
-# ══════════════════════════════════════════════════════════════════════════════
-
-def make_fig5_3d_result(wide_bgr, tele_results, wide_balls):
-    print("[Fig 5] 3D distance estimation …")
     vis = wide_bgr.copy()
+    y0, y1 = by, min(by + th_px, vis.shape[0])
+    x0, x1 = bx, min(bx + tw,    vis.shape[1])
+    th2, tw2 = y1 - y0, x1 - x0
 
-    for i, tr in enumerate(tele_results):
-        D_m, alpha = estimate_distance(
-            (tr["cx"], tr["cy"]), tr["pts"], K_TELE, SPHERE_RADIUS_M)
-        if D_m is None:
-            print(f"  Ball #{i}: distance estimation failed")
-            continue
-        print(f"  Ball #{i}: D = {D_m:.3f} m  alpha = {math.degrees(alpha):.4f}°")
+    roi_w = vis[y0:y1, x0:x1].astype(np.float32)
+    roi_t = tele_warp_col[:th2, :tw2].astype(np.float32)
+    vis[y0:y1, x0:x1] = np.clip(
+        roi_w * (1 - pl.BLEND_ALPHA) + roi_t * pl.BLEND_ALPHA,
+        0, 255).astype(np.uint8)
 
-        # Corresponding wide ball (by index)
-        if i < len(wide_balls):
-            cx_w, cy_w, r_w = wide_balls[i][0], wide_balls[i][1], wide_balls[i][2]
-        else:
-            cx_w, cy_w, r_w = wide_balls[0][0], wide_balls[0][1], wide_balls[0][2]
+    cv2.rectangle(vis, (x0, y0), (x1, y1), (0, 220, 255), 4, cv2.LINE_AA)
+    label(vis, f"Tele FOV  scale={best_s:.3f}  ECC ρ={best_all['ecc_cc']:.4f}",
+          (x0 + 8, y0 + 48), 1.1, (0, 220, 255), 2)
 
-        # Draw result on wide image
-        cv2.circle(vis,(int(cx_w),int(cy_w)),int(r_w+6),ORANGE,3,cv2.LINE_AA)
-        cv2.circle(vis,(int(cx_w),int(cy_w)),5,YELLOW,-1,cv2.LINE_AA)
+    # project primary tele target onto wide via H_total
+    uv = pl.apply_H_to_point(H_total, primary["cx"], primary["cy"])
+    if uv:
+        cx_m, cy_m = int(round(uv[0])), int(round(uv[1]))
+        cv2.circle(vis,    (cx_m, cy_m), 20, GREEN, 4, cv2.LINE_AA)
+        cv2.drawMarker(vis, (cx_m, cy_m), GREEN,
+                       cv2.MARKER_CROSS, 60, 4, cv2.LINE_AA)
+        label(vis, "H_total(tele centre)", (cx_m + 25, cy_m - 12), 1.0, GREEN)
 
-        label = f"D={D_m:.2f}m   alpha={math.degrees(alpha):.3f}deg"
-        put_label(vis, label,
-                  (int(cx_w - r_w), int(cy_w - r_w - 26)),
-                  scale=1.1, color=YELLOW, thickness=2)
-
-        # also show uncertainty
-        if tr.get("std") is not None:
-            std_r = tr["std"][2]
-            # propagate: dD/dr_px ≈ -D / (r_px * tan(alpha))
-            r_px = tr["r"]
-            dD = D_m / (r_px + 1e-9) * std_r
-            put_label(vis, f"std_r={std_r:.2f}px  -> stdD~{dD:.3f}m",
-                      (int(cx_w - r_w), int(cy_w - r_w - 56)),
-                      scale=0.9, color=(200,200,200), thickness=2)
-
-    put_label(vis, "3D Localisation:  D = R / sin(alpha)",
-              (30, 60), scale=2.0, color=WHITE, thickness=3)
-    put_label(vis, "distance estimated from tele angular radius",
-              (30, 110), scale=1.4, color=(200,200,200), thickness=2)
-
-    out, _ = scale_for_display(vis, 1600)
-    path = os.path.join(OUT_DIR, "05_3d_result.jpg")
-    cv2.imwrite(path, out, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    print(f"  → {path}")
+    label(vis,
+          "Fig 4  Wide-Tele Registration — scale TM + ECC + H_total",
+          (30, 68), 1.7, WHITE, 3)
+    save(vis, "04_registration_blend.jpg")
+    return H_total
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Main
+# Fig 5 — 3D fusion  (real H_total + undistort + D × r_wide)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def make_fig5(wide_bgr, tele_targets, wide_targets, H_total):
+    """
+    For each tele target:
+      1. compute_distance_from_boundary_points  →  D, alpha
+      2. apply_H_to_point(H_total, cx_t, cy_t)  →  wide pixel
+      3. undistort_point_to_unit_ray             →  r_wide
+      4. P = D * r_wide
+    Same code path as the production pipeline's main().
+    """
+    print("[Fig 5] 3D fusion …")
+    if H_total is None:
+        print("  [SKIP] No H_total available")
+        return
+
+    D_w = pl.D_WIDE if pl.USE_DISTORTION else np.zeros_like(pl.D_WIDE)
+    D_t = pl.D_TELE if pl.USE_DISTORTION else np.zeros_like(pl.D_TELE)
+    sphere_r = float(pl.SPHERE_DIAMETER_M) * 0.5
+
+    vis = wide_bgr.copy()
+    # draw all wide targets lightly for context
+    for wt in wide_targets:
+        cv2.circle(vis, (int(wt["cx"]), int(wt["cy"])), int(wt["r"]),
+                   (100, 100, 100), 1, cv2.LINE_AA)
+
+    # yaw/pitch of tele axis in wide frame (for dual-branch check)
+    u_ax, v_ax = float(pl.K_TELE[0, 2]), float(pl.K_TELE[1, 2])
+    axis = pl.apply_H_to_point(H_total, u_ax, v_ax)
+    if axis:
+        yaw, pitch = pl.yaw_pitch_from_wide_pixel(axis[0], axis[1], pl.K_WIDE)
+        R_t2w      = pl.R_from_yaw_pitch(yaw, pitch)
+    else:
+        R_t2w = None
+
+    for t in tele_targets:
+        cx_t, cy_t = float(t["cx"]), float(t["cy"])
+        r_fit      = float(t.get("r", 0.0))
+
+        # boundary points: prefer real subpixel pts, fall back to circle sample
+        pts = t.get("pts", [])
+        if len(pts) < 20:
+            pts = pl.sample_circle_boundary(cx_t, cy_t, r_fit, n=72)
+
+        # 1 — depth from tele angular radius
+        Dm, alpha = pl.compute_distance_from_boundary_points(
+            tele_center_uv=(cx_t, cy_t),
+            boundary_pts_uv=pts,
+            K=pl.K_TELE, D=D_t,
+            sphere_radius_m=sphere_r)
+        if Dm is None:
+            Dm, alpha = pl.compute_distance_from_radius(r_fit, pl.K_TELE, sphere_r)
+        if Dm is None:
+            print(f"  Target {t['id']}: depth estimation failed")
+            continue
+
+        # 2 — map tele centre to wide pixel via H_total
+        uv = pl.apply_H_to_point(H_total, cx_t, cy_t)
+        if uv is None:
+            continue
+        u_w, v_w = uv
+
+        # 3 — wide unit ray
+        r_w = pl.undistort_point_to_unit_ray(u_w, v_w, pl.K_WIDE, D_w)
+
+        # 4 — 3D position in wide frame
+        P_w    = Dm * r_w
+        u_proj, v_proj = pl.project_point(pl.K_WIDE, P_w)
+
+        # dual-branch check
+        dPw = float("nan")
+        if R_t2w is not None:
+            r_t  = pl.undistort_point_to_unit_ray(cx_t, cy_t, pl.K_TELE, D_t)
+            P_wR = R_t2w @ (Dm * r_t)
+            dPw  = float(np.linalg.norm(P_w - P_wR))
+
+        print(f"  Target {t['id']}: D={Dm:.3f}m  "
+              f"alpha={math.degrees(alpha):.4f}°  "
+              f"P=({P_w[0]:.3f},{P_w[1]:.3f},{P_w[2]:.3f})m  "
+              f"dual_err={dPw:.4f}m")
+
+        # annotate on wide image at projected pixel
+        pu, pv = int(round(u_proj)), int(round(v_proj))
+        cv2.circle(vis,    (pu, pv), 22, ORANGE, 4, cv2.LINE_AA)
+        cv2.drawMarker(vis, (pu, pv), YELLOW,
+                       cv2.MARKER_CROSS, 60, 4, cv2.LINE_AA)
+
+        lines = [
+            f"D  = {Dm:.3f} m",
+            f"X  = {P_w[0]:.3f} m",
+            f"Y  = {P_w[1]:.3f} m",
+            f"Z  = {P_w[2]:.3f} m",
+            f"α  = {math.degrees(alpha):.4f}°",
+        ]
+        if not math.isnan(dPw):
+            lines.append(f"dual err = {dPw*1000:.1f} mm")
+
+        bx_l, by_l = pu + 30, pv - 90
+        ov = vis.copy()
+        cv2.rectangle(ov, (bx_l - 6, by_l - 6),
+                      (bx_l + 420, by_l + len(lines)*38 + 12),
+                      BLACK, -1)
+        cv2.addWeighted(ov, 0.55, vis, 0.45, 0, vis)
+        for li, line in enumerate(lines):
+            col = YELLOW if li == 0 else (GREEN if 1 <= li <= 3 else (180, 180, 180))
+            label(vis, line, (bx_l, by_l + li*38), 1.0, col, 2)
+
+    label(vis,
+          "Fig 5  3D Fusion:  D = R/sin(α)   P = D × undistort(H_total · p_tele)",
+          (30, 68), 1.5, WHITE, 3)
+    save(vis, "05_3d_result.jpg")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    print("Loading images …")
+    print("=" * 62)
+    print("  Wide-Tele 3D Localisation — Demo Visuals")
+    print("=" * 62)
+
+    print("\nLoading images …")
     wide_bgr = cv2.imread(WIDE_PATH)
     tele_bgr = cv2.imread(TELE_PATH)
-    assert wide_bgr is not None, f"Cannot read {WIDE_PATH}"
-    assert tele_bgr is not None, f"Cannot read {TELE_PATH}"
-    print(f"  Wide: {wide_bgr.shape}   Tele: {tele_bgr.shape}")
+    assert wide_bgr is not None, f"Cannot read: {WIDE_PATH}"
+    assert tele_bgr is not None, f"Cannot read: {TELE_PATH}"
+    print(f"  Wide : {wide_bgr.shape[1]}×{wide_bgr.shape[0]}")
+    print(f"  Tele : {tele_bgr.shape[1]}×{tele_bgr.shape[0]}")
 
-    wide_balls   = make_fig1_wide_detection(wide_bgr)
-    tele_results = make_fig2_tele_subpixel(tele_bgr)
-    make_fig3_likelihood(tele_bgr)
-    make_fig4_registration(wide_bgr, tele_bgr, wide_balls, tele_results)
-    make_fig5_3d_result(wide_bgr, tele_results, wide_balls)
+    print("\n--- Stage 1: Wide detection ---")
+    wide_targets = pl.detect_wide_red_targets(wide_bgr)
+    make_fig1(wide_bgr, wide_targets)
 
-    print(f"\n✓  All figures saved to  {os.path.abspath(OUT_DIR)}/")
-    print("   01_wide_detection.jpg      — wide image, all balls annotated")
-    print("   02_tele_subpixel.jpg       — subpixel boundary + IRLS fit")
-    print("   03_likelihood_map.jpg      — red-likelihood heatmap")
-    print("   04_registration_blend.jpg  — tele warped onto wide")
-    print("   05_3d_result.jpg           — 3D distance per ball")
+    print("\n--- Stage 2: Tele subpixel fit ---")
+    tele_targets = make_fig2(tele_bgr)
+    make_fig3(tele_bgr, tele_targets)
+
+    if not tele_targets:
+        print("[ABORT] No tele targets found — cannot proceed to registration.")
+        return
+
+    print("\n--- Stage 3: Registration ---")
+    H_total = make_fig4(wide_bgr, tele_bgr, wide_targets, tele_targets)
+
+    print("\n--- Stage 4: 3D fusion ---")
+    make_fig5(wide_bgr, tele_targets, wide_targets, H_total)
+
+    print(f"\n✓  All figures saved to {os.path.abspath(OUT_DIR)}/")
 
 
 if __name__ == "__main__":
