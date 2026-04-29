@@ -17,7 +17,7 @@ with only opencv-python and numpy installed:
     pip install opencv-python numpy
     python ball_3d_localization_demo.py
 
-Author: <your name>
+Author: <Zilong Liu>
 """
 
 import math
